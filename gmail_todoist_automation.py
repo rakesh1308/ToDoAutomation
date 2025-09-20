@@ -27,8 +27,7 @@ class EmailTaskAutomation:
     def setup_apis(self):
         """Authenticates with Google and initializes API clients."""
         creds = None
-        # The file token.pickle stores the user's access and refresh tokens, and is
-        # created automatically when the authorization flow completes for the first time.
+        # The file token.pickle stores the user's access and refresh tokens.
         if os.path.exists('token.pickle'):
             with open('token.pickle', 'rb') as token:
                 creds = pickle.load(token)
