@@ -1,0 +1,7 @@
+{
+  "build": {
+    "install": ["pip install -r requirements.txt"],
+    "deploy": []
+  },
+  "start": "python gmail_todoist_automation.py"
+}
