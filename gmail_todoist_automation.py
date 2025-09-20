@@ -1,170 +1,319 @@
-import os
-import base64
-import pickle
-import time
-import re
+# file: app.py
+import os, re, time, json, base64, pickle, sys, traceback
+from typing import Dict, Any, Optional
+
+# --- 3rd-party deps ---
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import openai
 from todoist_api_python.api import TodoistAPI
 
-class EmailTaskAutomation:
-    def __init__(self):
-        # Load environment variables
-        self.OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-        self.TODOIST_API_TOKEN = os.getenv('TODOIST_API_TOKEN')
-        self.GMAIL_LABEL = os.getenv('GMAIL_LABEL')  # Made optional at build time
+# OpenAI: works with legacy SDK (openai.ChatCompletion) or new SDK (client.chat.completions)
+# If you use "openai>=1.0", switch to the new style below.
+try:
+    import openai
+    OPENAI_NEW_SDK = False
+except Exception:
+    from openai import OpenAI
+    OPENAI_NEW_SDK = True
 
-        # Validate that GMAIL_LABEL is set when the script actually runs
-        if not self.GMAIL_LABEL:
-            print("ERROR: GMAIL_LABEL environment variable is not set. Please add it in your Railway service's 'Variables' tab.")
-            exit(1)  # Stop the script if the label is missing
+# --------------------------- Config ---------------------------
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
-        self.SCOPES = ['https://www.googleapis.com/auth/gmail.modify']
-        self.setup_apis()
+# Required:
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+TODOIST_API_TOKEN = os.environ.get("TODOIST_API_TOKEN", "")
+GMAIL_LABEL = os.environ.get("GMAIL_LABEL", "")  # e.g., "FromAutomation" or "INBOX/SubLabel"
 
-    def setup_apis(self):
-        """Authenticates with Google and initializes API clients."""
-        creds = None
-        # The file token.pickle stores the user's access and refresh tokens.
-        if os.path.exists('token.pickle'):
-            with open('token.pickle', 'rb') as token:
-                creds = pickle.load(token)
-        
-        # If there are no (valid) credentials available, let the user log in.
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    'credentials.json', self.SCOPES)
+# OAuth client as ENV (recommended for Railway):
+# Put the **exact** JSON you download from GCP (OAuth 2.0 Client ID -> Desktop App) into this var,
+# base64-encoded to avoid quoting issues. Example: base64(credentials.json) -> GOOGLE_OAUTH_CLIENT_JSON_B64
+GOOGLE_OAUTH_CLIENT_JSON_B64 = os.environ.get("GOOGLE_OAUTH_CLIENT_JSON_B64", "")
+
+# Optional: use a file path fallback if you really want a file (less reliable on PaaS)
+CREDENTIALS_JSON_PATH = os.environ.get("CREDENTIALS_JSON_PATH", "credentials.json")
+
+# Where to persist Google token (Railway filesystem is ephemeral unless you attach a Volume)
+TOKEN_PATH = os.environ.get("TOKEN_PATH", "token.json")
+
+# Polling interval seconds
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
+
+# Local vs headless auth:
+RUN_MODE = os.environ.get("RUN_MODE", "headless")  # "local" -> launches browser, "headless" -> paste code into console
+
+# ------------------------ Helpers ----------------------------
+
+def _fail(msg: str):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.stderr.flush()
+    sys.stdout.flush()
+    time.sleep(0.5)
+    sys.exit(1)
+
+def _parse_oauth_client_from_env_or_file() -> Dict[str, Any]:
+    """
+    Prefer GOOGLE_OAUTH_CLIENT_JSON_B64; fall back to reading CREDENTIALS_JSON_PATH.
+    Performs robust checks so HTML/PDF/ZIP can't sneak in.
+    """
+    if GOOGLE_OAUTH_CLIENT_JSON_B64:
+        try:
+            raw = base64.b64decode(GOOGLE_OAUTH_CLIENT_JSON_B64)
+        except Exception as e:
+            raise RuntimeError(f"GOOGLE_OAUTH_CLIENT_JSON_B64 is not valid base64: {e}")
+    else:
+        # Fallback to file (not recommended on Railway)
+        if not os.path.exists(CREDENTIALS_JSON_PATH):
+            raise RuntimeError(
+                "No GOOGLE_OAUTH_CLIENT_JSON_B64 and credentials file not found at "
+                f"{CREDENTIALS_JSON_PATH}."
+            )
+        with open(CREDENTIALS_JSON_PATH, "rb") as f:
+            raw = f.read()
+
+    # Quick wrong-file checks
+    prefix = raw[:20].lower()
+    if raw.startswith(b"%PDF"):
+        raise RuntimeError("OAuth JSON appears to be a PDF. Download the actual JSON from GCP.")
+    if raw.startswith(b"PK"):
+        raise RuntimeError("OAuth JSON looks like a ZIP. Unzip and use the JSON inside.")
+    if prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html"):
+        raise RuntimeError("OAuth JSON is actually an HTML page. Download the raw JSON file.")
+
+    # Decode tolerant of BOM/UTF-16
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("utf-16")
+        except UnicodeDecodeError:
+            raise RuntimeError("OAuth JSON is not valid UTF-8/UTF-16 text.")
+
+    try:
+        data = json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"OAuth JSON cannot be parsed: {e}")
+
+    # Expect keys like "installed" for Desktop client
+    if not any(k in data for k in ("installed", "web")):
+        # Some downloads wrap it differently, but Desktop apps should have "installed"
+        # If your JSON is nested, allow that here:
+        raise RuntimeError("OAuth JSON missing 'installed' or 'web' section. Ensure it's a Desktop app client.")
+
+    return data
+
+def _google_auth() -> Any:
+    """
+    Returns a Gmail API service client, storing token to TOKEN_PATH.
+    Headless-safe by default (prints URL, expects code in console).
+    """
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        try:
+            with open(TOKEN_PATH, "rb") as f:
+                creds = pickle.load(f)
+        except Exception:
+            # Corrupt token; ignore so we can recreate
+            creds = None
+
+    if not creds or not getattr(creds, "valid", False):
+        if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            creds.refresh(Request())
+        else:
+            client_config = _parse_oauth_client_from_env_or_file()
+            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            if RUN_MODE.lower() == "local":
+                # Opens a browser; good for laptop
                 creds = flow.run_local_server(port=0)
-            # Save the credentials for the next run
-            with open('token.pickle', 'wb') as token:
-                pickle.dump(creds, token)
-        
-        self.gmail = build('gmail', 'v1', credentials=creds)
-        openai.api_key = self.OPENAI_API_KEY
-        self.todoist = TodoistAPI(self.TODOIST_API_TOKEN)
+            else:
+                # Headless: prints a URL + asks for code in the logs/console
+                print("Headless OAuth: open the URL below, authorize, then paste the code here:")
+                creds = flow.run_console()
 
-    def get_labeled_emails(self):
-        """Fetches unread emails with the specified Gmail label."""
-        query = f"label:{self.GMAIL_LABEL} is:unread"
-        result = self.gmail.users().messages().list(userId='me', q=query).execute()
-        return result.get('messages', [])
+        with open(TOKEN_PATH, "wb") as f:
+            pickle.dump(creds, f)
 
-    def get_email_content(self, message_id):
-        """Extracts subject, sender, and body from an email."""
-        message = self.gmail.users().messages().get(userId='me', id=message_id).execute()
-        headers = message['payload'].get('headers', [])
-        subject = next((h['value'] for h in headers if h['name'] == 'Subject'), 'No Subject')
-        sender = next((h['value'] for h in headers if h['name'] == 'From'), 'Unknown Sender')
-        body = self.extract_body(message['payload'])
-        return {'id': message_id, 'subject': subject, 'sender': sender, 'body': body}
+    service = build("gmail", "v1", credentials=creds)
+    return service
 
-    def extract_body(self, payload):
-        """Recursively extracts the plain text body from an email payload."""
-        if 'parts' in payload:
-            for part in payload['parts']:
-                if part['mimeType'] == 'text/plain':
-                    data = part['body'].get('data', '')
-                    return base64.urlsafe_b64decode(data).decode('utf-8')
-        elif payload.get('mimeType') == 'text/plain':
-            data = payload['body'].get('data', '')
-            return base64.urlsafe_b64decode(data).decode('utf-8')
-        return ''
+def _init_todoist() -> TodoistAPI:
+    if not TODOIST_API_TOKEN:
+        _fail("TODOIST_API_TOKEN is not set.")
+    return TodoistAPI(TODOIST_API_TOKEN)
 
-    def process_with_openai(self, email_data):
-        """Uses OpenAI to format the email content into a structured task."""
-        prompt = f"""
-From: {email_data['sender']}
-Subject: {email_data['subject']}
+def _init_openai():
+    if not OPENAI_API_KEY:
+        _fail("OPENAI_API_KEY is not set.")
+    if OPENAI_NEW_SDK:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        return client
+    else:
+        openai.api_key = OPENAI_API_KEY
+        return None
+
+def _gmail_list_label_unread(service, label_name: str) -> list:
+    q = f'label:"{label_name}" is:unread'
+    res = service.users().messages().list(userId="me", q=q).execute()
+    return res.get("messages", [])
+
+def _gmail_get(service, msg_id: str) -> Dict[str, Any]:
+    return service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+
+def _gmail_mark_read(service, msg_id: str):
+    service.users().messages().modify(
+        userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}
+    ).execute()
+
+def _extract_plain_body(payload: Dict[str, Any]) -> str:
+    """
+    Best-effort plain text extraction; falls back to stripping HTML if needed.
+    """
+    import base64 as b64
+    from html import unescape
+
+    def decode_part(_part):
+        data = _part.get("body", {}).get("data", "")
+        if not data:
+            return ""
+        try:
+            return b64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    # multipart
+    if "parts" in payload:
+        # Prefer text/plain
+        for p in payload["parts"]:
+            if p.get("mimeType") == "text/plain":
+                return decode_part(p)
+        # Fallback to first part’s text content (strip HTML)
+        for p in payload["parts"]:
+            text = decode_part(p)
+            if text:
+                # quick de-HTML
+                return unescape(re.sub(r"<[^>]+>", " ", text))
+    # single part
+    if payload.get("mimeType") == "text/plain":
+        return decode_part(payload)
+    if payload.get("mimeType", "").startswith("text/"):
+        text = decode_part(payload)
+        return unescape(re.sub(r"<[^>]+>", " ", text))
+    return ""
+
+def _headers_lookup(headers: list, name: str, default: str = "") -> str:
+    return next((h["value"] for h in headers if h.get("name", "").lower() == name.lower()), default)
+
+def _ai_summarize_to_task(openai_client, email: Dict[str, str]) -> Dict[str, Optional[str]]:
+    """
+    Calls GPT to structure: TITLE, DESCRIPTION, PRIORITY, DUE_DATE
+    """
+    system = "You turn emails into concise, well-structured Todoist tasks."
+    user = f"""From: {email['from']}
+Subject: {email['subject']}
 
 Body:
-{email_data['body']}
+{email['body']}
 
----
-Based on the email above, create a concise task. Format the output exactly as follows, with no extra text:
-TITLE: [A short, clear task title]
-DESCRIPTION: [A detailed description of the task]
-PRIORITY: [High, Medium, or Low]
-DUE_DATE: [A due date like 'tomorrow' or 'next Friday' if mentioned, otherwise None]
-"""
-        response = openai.ChatCompletion.create(
+Format exactly:
+TITLE: <short task title>
+DESCRIPTION: <detailed task description>
+PRIORITY: <High|Medium|Low>
+DUE_DATE: <natural-language due date if present, else None>"""
+
+    if OPENAI_NEW_SDK:
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=0.2,
+            max_tokens=300,
+        )
+        content = resp.choices[0].message.content
+    else:
+        resp = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an assistant that converts emails into structured tasks."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=400,
-            temperature=0.5
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=0.2,
+            max_tokens=300,
         )
-        return response.choices[0].message.content
+        content = resp.choices[0].message.content
 
-    def parse_ai_response(self, ai_text):
-        """Parses the structured text from the AI into a dictionary."""
-        title = re.search(r"TITLE:\s*(.*)", ai_text)
-        description = re.search(r"DESCRIPTION:\s*([\s\S]*?)(?=PRIORITY:)", ai_text)
-        priority = re.search(r"PRIORITY:\s*(High|Medium|Low)", ai_text, re.IGNORECASE)
-        due_date = re.search(r"DUE_DATE:\s*(.*)", ai_text)
+    # Parse
+    title = re.search(r"^TITLE:\s*(.*)$", content, re.MULTILINE)
+    desc = re.search(r"^DESCRIPTION:\s*([\s\S]*?)^\s*PRIORITY:", content, re.MULTILINE)
+    prio = re.search(r"^PRIORITY:\s*(High|Medium|Low)", content, re.IGNORECASE | re.MULTILINE)
+    due  = re.search(r"^DUE_DATE:\s*(.*)$", content, re.MULTILINE)
 
-        return {
-            'title': title.group(1).strip() if title else 'Untitled Task',
-            'description': description.group(1).strip() if description else ai_text,
-            'priority': priority.group(1).capitalize() if priority else 'Medium',
-            'due_date': due_date.group(1).strip() if due_date and 'none' not in due_date.group(1).lower() else None
-        }
+    return {
+        "title": (title.group(1).strip() if title else "Untitled Task"),
+        "description": (desc.group(1).strip() if desc else content.strip()),
+        "priority": (prio.group(1).capitalize() if prio else "Medium"),
+        "due_date": (d.strip() if (due and (d := due.group(1)) and d.strip().lower() != "none") else None),
+    }
 
-    def create_todoist_task(self, task_data, email_data):
-        """Creates a new task in Todoist."""
-        priority_map = {'High': 4, 'Medium': 2, 'Low': 1}
-        full_description = (
-            f"{task_data['description']}\n\n"
-            f"--- Email Context ---\n"
-            f"From: {email_data['sender']}\n"
-            f"Subject: {email_data['subject']}"
-        )
-        
-        self.todoist.add_task(
-            content=task_data['title'],
-            description=full_description,
-            priority=priority_map.get(task_data['priority'], 2),
-            due_string=task_data['due_date'],
-            labels=["FromEmail"]
-        )
-        print(f"Created task: {task_data['title']}")
+def _todoist_priority_num(p: str) -> int:
+    return {"High": 4, "Medium": 2, "Low": 1}.get(p, 2)
 
-    def mark_email_as_processed(self, message_id):
-        """Marks the email as read so it is not processed again."""
-        self.gmail.users().messages().modify(
-            userId='me', id=message_id, body={'removeLabelIds': ['UNREAD']}
-        ).execute()
+def _process_one_message(service, todoist_api, openai_client, message_id: str):
+    m = _gmail_get(service, message_id)
+    payload = m.get("payload", {})
+    headers = payload.get("headers", [])
+    subject = _headers_lookup(headers, "Subject", "No Subject")
+    sender = _headers_lookup(headers, "From", "Unknown")
 
-    def run(self):
-        """The main execution loop for the automation."""
-        print("Checking for new emails to process...")
-        emails_to_process = self.get_labeled_emails()
-        if not emails_to_process:
-            print("No new emails found.")
-            return
+    body = _extract_plain_body(payload)
+    if not body.strip():
+        print(f"[skip] Empty body: {subject}")
+        _gmail_mark_read(service, message_id)
+        return
 
-        for message_summary in emails_to_process:
-            try:
-                email_content = self.get_email_content(message_summary['id'])
-                if not email_content['body'].strip():
-                    print(f"Skipping email with no content: {email_content['subject']}")
-                    self.mark_email_as_processed(message_summary['id'])
-                    continue
+    email_obj = {"from": sender, "subject": subject, "body": body}
+    task = _ai_summarize_to_task(openai_client, email_obj)
 
-                ai_response = self.process_with_openai(email_content)
-                task_details = self.parse_ai_response(ai_response)
-                self.create_todoist_task(task_details, email_content)
-                self.mark_email_as_processed(message_summary['id'])
-                time.sleep(1)  # Small delay to avoid hitting API rate limits
-            except Exception as e:
-                print(f"Failed to process email {message_summary['id']}. Error: {e}")
+    full_description = (
+        f"{task['description']}\n\n"
+        f"--- Email Context ---\nFrom: {sender}\nSubject: {subject}"
+    )
+    todoist_api.add_task(
+        content=task["title"],
+        description=full_description[:9000],  # safety
+        priority=_todoist_priority_num(task["priority"]),
+        due_string=task["due_date"],
+        labels=["FromEmail"]
+    )
+    print(f"[ok] Created task: {task['title']}")
+    _gmail_mark_read(service, message_id)
 
-if __name__ == '__main__':
-    automation = EmailTaskAutomation()
-    automation.run()
+def main_loop():
+    if not GMAIL_LABEL:
+        _fail("GMAIL_LABEL is not set.")
+    if not TODOIST_API_TOKEN:
+        _fail("TODOIST_API_TOKEN is not set.")
+    if not OPENAI_API_KEY:
+        _fail("OPENAI_API_KEY is not set.")
+
+    gmail = _google_auth()
+    todoist_api = _init_todoist()
+    openai_client = _init_openai()
+
+    print(f"Worker started. Polling label: {GMAIL_LABEL} every {POLL_SECONDS}s")
+    while True:
+        try:
+            msgs = _gmail_list_label_unread(gmail, GMAIL_LABEL)
+            if not msgs:
+                print("[idle] No new emails")
+            else:
+                for msg in msgs:
+                    try:
+                        _process_one_message(gmail, todoist_api, openai_client, msg["id"])
+                        time.sleep(1)  # mild throttle
+                    except Exception as e:
+                        print(f"[err] Failed message {msg.get('id')}: {e}")
+                        traceback.print_exc()
+            sys.stdout.flush()
+        except Exception as e:
+            print(f"[loop err] {e}")
+            traceback.print_exc()
+        time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    main_loop()
